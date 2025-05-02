@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package websocket;
+
+option go_package = "websocket-server/api/proto";
+
+import "google/api/annotations.proto";
+
+// 웹소켓 메시지 서비스
+service WebSocketService {
+  // 메시지 전송
+  rpc SendMessage (MessageRequest) returns (MessageResponse) {
+    option (google.api.http) = {
+      post: "/v1/messages"
+      body: "*"
+    };
+  }
+  // 메시지 구독
+  rpc Subscribe (SubscribeRequest) returns (stream MessageResponse) {
+    option (google.api.http) = {
+      get: "/v1/messages/subscribe"
+    };
+  }
+}
+
+// 메시지 요청
+message MessageRequest {
+  string type = 1;
+  string payload = 2;
+  string from = 3;
+  string to = 4;
+}
+
+// 메시지 응답
+message MessageResponse {
+  string type = 1;
+  string payload = 2;
+  string from = 3;
+  string to = 4;
+  string timestamp = 5;
+}
+
+// 구독 요청
+message SubscribeRequest {
+  string client_id = 1;
+} 
