@@ -8,6 +8,7 @@ import (
 
 type Config struct {
 	Server ServerConfig `json:"server"`
+	App    AppConfig   `json:"app"`
 }
 
 type ServerConfig struct {
@@ -15,11 +16,22 @@ type ServerConfig struct {
 	GRPCPort string `json:"grpc_port"`
 }
 
+type AppConfig struct {
+	Name        string `json:"name"`
+	Environment string `json:"environment"`
+	Instance    string `json:"instance"`
+}
+
 func LoadConfig() *Config {
 	config := &Config{
 		Server: ServerConfig{
 			Port:     "8080",
 			GRPCPort: "50051",
+		},
+		App: AppConfig{
+			Name:        "websocket-server",
+			Environment: "local",
+			Instance:    "1",
 		},
 	}
 

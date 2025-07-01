@@ -1,0 +1,65 @@
+syntax = "proto3";
+import "google/protobuf/empty.proto";
+
+option go_package = "/proto";
+
+service UserInfoService {
+  rpc GetPassportByBearer (google.protobuf.Empty) returns (Passport);
+  rpc GetUserInfoByBearer (google.protobuf.Empty) returns (UserInfoResponse);
+  rpc GetUserInfoInApplication (UserInfoInApplicationRequest) returns (UserInfoInApplicationPageResponse);
+}
+
+service TokenService {
+  rpc reissueToken(ReissueTokenRequest) returns (JwtTokenResponse);
+}
+
+message ReissueTokenRequest {
+  string idempotentKey = 1;
+  string refreshToken = 2;
+}
+
+// RFC 6819  Refresh Token Rotation
+message JwtTokenResponse {
+  string accessToken = 1;
+  string refreshToken = 2;
+  int64 accessTokenExpiresIn = 3;
+  int64 refreshTokenExpiresIn = 4;
+}
+
+message UserInfoInApplicationRequest {
+  int32 page = 1;
+  int32 size = 2;
+}
+
+message UserInfoInApplicationPageResponse {
+  // 조회된 사용자 정보 목록
+  repeated UserInfoInApplicationResponse items = 1;
+  // 현재 페이지 번호 (1부터 시작)
+  int32 page = 2;
+  // 페이지 크기
+  int32 size = 3;
+  int32 totalItems = 4;
+  // 전체 페이지 수
+  int32 totalPages = 5;
+}
+
+message UserInfoInApplicationResponse {
+  string userId = 1;
+  string userName = 2;
+  string applicationRole = 3;
+  string email = 4;
+}
+
+message Passport {
+  string id = 1;
+  string role = 2;
+  string applicationId = 3;
+  optional UserInfoResponse userInfo = 4;
+}
+
+message UserInfoResponse {
+  optional string email = 1;
+  optional string name = 2;
+  string applicationRole = 3;
+  int32 accessLevel = 4;
+}

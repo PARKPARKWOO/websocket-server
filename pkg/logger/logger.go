@@ -1,19 +1,28 @@
 package logger
 
 import (
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+	"os"
+	"websocket-server/internal/config"
+
+	"github.com/sirupsen/logrus"
 )
 
-func InitLogger() *zap.Logger {
-	config := zap.NewProductionConfig()
-	config.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-	config.EncoderConfig.EncodeLevel = zapcore.CapitalLevelEncoder
+func InitLogger(cfg *config.Config) *logrus.Logger {
+	logger := logrus.New()
+	logger.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+		DisableColors:   false,
+	})
 
-	logger, err := config.Build()
-	if err != nil {
-		panic(err)
+	// 로그 레벨 설정
+	logger.SetLevel(logrus.InfoLevel)
+	if cfg.App.Environment == "local" {
+		logger.SetLevel(logrus.DebugLevel)
 	}
+
+	// 콘솔 출력 설정
+	logger.SetOutput(os.Stdout)
 
 	return logger
 } 
