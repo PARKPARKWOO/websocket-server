@@ -1,0 +1,102 @@
+name: Build Go image if not exists and Trigger dispatch to deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Select the environment to deploy (dev/prod)"
+        required: true
+        default: "dev"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    outputs:
+      result_image_tag: ${{ steps.generate_image_tag.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set environment variables
+        run: |
+          echo "repository_name=${{ secrets.DOCKERHUB_USERNAME }}/websocket-server" >> $GITHUB_ENV
+
+      - name: Generate image tag
+        id: generate_image_tag
+        run: |
+          IMAGE_TAG=$(git rev-parse --short HEAD)
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Check if image exists in Docker Hub
+        id: check_image
+        run: |
+          IMAGE=${{ env.repository_name }}
+          TAG=${{ env.image_tag }}
+          if docker manifest inspect ${IMAGE}:${TAG} > /dev/null 2>&1; then
+            echo "image_exists=true" >> $GITHUB_ENV
+            echo "Image ${IMAGE}:${TAG} already exists. Skipping build."
+          else
+            echo "image_exists=false" >> $GITHUB_ENV
+            echo "Image ${IMAGE}:${TAG} not found. Starting build process."
+          fi
+
+      # --- Go 빌드 단계 시작 ---
+      - name: Set up Go
+        if: env.image_exists == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # 원하는 Go 버전으로 설정
+
+      - name: Cache Go modules
+        if: env.image_exists == 'false'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build Go application
+        if: env.image_exists == 'false'
+        run: go build -v -o ./app . # 현재 디렉토리의 소스를 'app'이라는 이름의 바이너리로 빌드
+
+      - name: Build, tag, and push image to Docker Hub
+        if: env.image_exists == 'false'
+        env:
+          IMAGE_NAME: ${{ env.repository_name }}
+          IMAGE_TAG: ${{ env.image_tag }}
+        run: |
+          docker build -f ./Dockerfile -t $IMAGE_NAME:$IMAGE_TAG .
+          docker push $IMAGE_NAME:$IMAGE_TAG
+
+  trigger-dispatch:
+    name: Trigger dispatch to deploy
+    needs: check-and-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set environment variable based on input
+        run: |
+          echo "DEPLOY_ENV=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+
+      - name: Trigger deploy dispatch
+        run: |
+          curl -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GIT_PASSWORD }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/PARKPARKWOO/server-deploy/dispatches \
+            -d '{"event_type":"update_app_image_tag","client_payload":{"app":"websocket-server","environment":"'"${{ env.DEPLOY_ENV }}"'","image_tag":"'"${{ needs.check-and-build.outputs.result_image_tag }}"'"}}'
