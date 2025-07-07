@@ -55,8 +55,8 @@ RUN chown -R appuser:appgroup /app
 USER appuser
 
 # 헬스체크 추가
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/ || exit 1
+#HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+#    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/ || exit 1
 
 # 포트 노출
 EXPOSE 8080
