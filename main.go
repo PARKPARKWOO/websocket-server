@@ -95,13 +95,20 @@ func handlePrivateNetworkConnection(w http.ResponseWriter, r *http.Request) {
 func main() {
 	// Redis Pub/Sub 설정
 	redisHost := os.Getenv("REDIS_HOST")
+	redisPort := os.Getenv("REDIS_PORT")
+
 	if redisHost == "" {
-		redisHost = "localhost:6379"
+		redisHost = "localhost"
 	}
+	if redisPort == "" {
+		redisPort = "6379"
+	}
+	redisAddr := redisHost + ":" + redisPort
+
 	redisPassword := os.Getenv("REDIS_PASSWORD")
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr:     redisHost,
+		Addr:     redisAddr,
 		Password: redisPassword,
 		DB:       0, // use default DB
 	})
