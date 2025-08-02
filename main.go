@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -31,8 +35,17 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+// HTTP 요청/응답 구조체
+type CreateChatRoomRequest struct {
+	CreatedBy string `json:"createdBy"`
+}
+
+type SucceededApiResponseBody struct {
+	Data string `json:"data"`
+}
+
 // 클라이언트 연결을 처리하는 핸들러 함수입니다.
-func handleConnections(w http.ResponseWriter, r *http.Request, authClient *externalClient.AuthClient) {
+func handleConnections(w http.ResponseWriter, r *http.Request, authClient *externalClient.AuthClient, rdb *redis.Client) {
 	bearerToken, err := service.GetBearerToken(r)
 	if err != nil {
 		http.Error(w, "Unauthorized: Invalid token", http.StatusUnauthorized)
@@ -51,8 +64,25 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 	// 3. 인증 성공! 검증된 사용자 정보를 로그에 남기고, WebSocket 업그레이드 진행
 	log.Printf("사용자 인증 성공: UserID=%s, Role=%s\n", passport.Id, passport.Role)
 
-	// (선택사항) 인증된 사용자 정보를 context에 담아 다음 로직으로 전달
+	// Chat Room ID 처리
+	chatRoomId := r.URL.Query().Get("chat_room_id")
+	if chatRoomId == "" {
+		// chat_room_id가 없으면 새로운 채팅방 생성
+		var err error
+		chatRoomId, err = createChatRoom(passport.Id)
+		if err != nil {
+			log.Printf("채팅방 생성 실패: %v\n", err)
+			http.Error(w, "Internal Server Error: Failed to create chat room", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("새로운 채팅방 생성: %s\n", chatRoomId)
+	} else {
+		log.Printf("기존 채팅방 사용: %s\n", chatRoomId)
+	}
+
+	// (선택사항) 인증된 사용자 정보와 채팅방 ID를 context에 담아 다음 로직으로 전달
 	ctx := context.WithValue(r.Context(), "passport", passport)
+	ctx = context.WithValue(ctx, "chatRoomId", chatRoomId)
 	r = r.WithContext(ctx)
 
 	// HTTP GET 요청을 WebSocket 연결로 업그레이드합니다.
@@ -80,6 +110,16 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 		// 받은 메시지를 서버 로그에 출력합니다.
 		log.Printf("받은 메시지: %s", p)
 
+		// Redis에 메시지 발행 (publish) - 채팅방 ID를 채널명으로 사용
+		ctx := context.Background()
+		channelName := fmt.Sprintf("%s-%s", MirrorViewApplicationName, chatRoomId)
+		err = rdb.Publish(ctx, channelName, string(p)).Err()
+		if err != nil {
+			log.Printf("Redis 메시지 발행 실패: %v", err)
+		} else {
+			log.Printf("Redis 채널 '%s'에 메시지 발행: %s", channelName, string(p))
+		}
+
 		// 받은 메시지를 그대로 클라이언트에게 다시 보냅니다 (에코).
 		if err := ws.WriteMessage(messageType, p); err != nil {
 			log.Println("메시지 전송 실패: ", err)
@@ -90,6 +130,69 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 
 func handlePrivateNetworkConnection(w http.ResponseWriter, r *http.Request) {
 
+}
+
+// 채팅방 생성 함수
+func createChatRoom(userId string) (string, error) {
+	// HTTP 클라이언트 생성 (타임아웃 설정)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	// 요청 바디 생성
+	requestBody := CreateChatRoomRequest{
+		CreatedBy: userId,
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return "", fmt.Errorf("JSON 마샬링 실패: %v", err)
+	}
+
+	// MirrorViewDomain이 설정되지 않았을 경우 기본값 사용
+	domain := MirrorViewDomain
+	if domain == "" {
+		// Docker Swarm 환경에서는 서비스 이름으로 통신
+		domain = "http://mirror-view-backend:8080" // 또는 환경에 맞는 서비스명
+	}
+
+	url := fmt.Sprintf("%s/api/v1/chat/room", domain)
+
+	// HTTP POST 요청 생성
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("HTTP 요청 생성 실패: %v", err)
+	}
+
+	// Content-Type 헤더 설정
+	req.Header.Set("Content-Type", "application/json")
+
+	// 요청 전송
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("HTTP 요청 실패: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// 응답 상태 코드 확인
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP 요청 실패: status code %d", resp.StatusCode)
+	}
+
+	// 응답 바디 읽기
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("응답 바디 읽기 실패: %v", err)
+	}
+
+	// 응답 JSON 파싱
+	var response SucceededApiResponseBody
+	err = json.Unmarshal(bodyBytes, &response)
+	if err != nil {
+		return "", fmt.Errorf("응답 JSON 파싱 실패: %v", err)
+	}
+
+	return response.Data, nil
 }
 
 func main() {
@@ -158,7 +261,7 @@ func main() {
 	authClient := externalClient.NewAuthClient(conn)
 	// "/ws" 경로로 들어오는 요청을 handleConnections 함수가 처리하도록 라우팅합니다.
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		handleConnections(w, r, authClient)
+		handleConnections(w, r, authClient, rdb)
 	})
 
 	http.HandleFunc("/private/ws", func(w http.ResponseWriter, r *http.Request) {
