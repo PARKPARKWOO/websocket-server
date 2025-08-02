@@ -112,11 +112,12 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 
 		// Redis에 메시지 발행 (publish) - 채팅방 ID를 채널명으로 사용
 		ctx := context.Background()
-		err = rdb.Publish(ctx, MirrorViewApplicationName, string(p)).Err()
+		channelName := fmt.Sprintf("%s:%s", MirrorViewApplicationName, chatRoomId)
+		err = rdb.Publish(ctx, channelName, string(p)).Err()
 		if err != nil {
 			log.Printf("Redis 메시지 발행 실패: %v", err)
 		} else {
-			log.Printf("Redis 채널 '%s'에 메시지 발행: %s", MirrorViewApplicationName, string(p))
+			log.Printf("Redis 채널 '%s'에 메시지 발행: %s", channelName, string(p))
 		}
 
 		// 받은 메시지를 그대로 클라이언트에게 다시 보냅니다 (에코).
