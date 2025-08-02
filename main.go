@@ -112,31 +112,38 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 
 	// 클라이언트로부터 메시지를 지속적으로 읽기 위한 무한 루프입니다.
 	for {
-		// 메시지 타입 (이진/텍스트), 메시지 내용, 에러를 반환합니다.
-		messageType, p, err := ws.ReadMessage()
+		_, p, err := ws.ReadMessage()
 		if err != nil {
-			// 클라이언트 연결이 끊어지는 등 에러가 발생하면 루프를 종료합니다.
-			log.Println("클라이언트 연결이 끊어졌습니다: ", err)
+			log.Println("클라이언트 연결 종료:", err)
 			break
 		}
 
-		// 받은 메시지를 서버 로그에 출력합니다.
-		log.Printf("받은 메시지: %s", p)
+		// 2) JSON → SubscribeMessage 언마샬
+		var subMsg SubscribeMessage
+		if err := json.Unmarshal(p, &subMsg); err != nil {
+			log.Printf("JSON 언마샬링 실패: %v\n", err)
+			continue
+		}
 
-		// Redis에 메시지 발행 (publish) - 채팅방 ID를 채널명으로 사용
-		ctx := context.Background()
+		// 3) sender 가 비어 있다면, passport.Id 등으로 채워줍니다
+		if subMsg.Sender == "" {
+			// r.Context()에 담아둔 passport 꺼내기
+			passport := r.Context().Value("passport").(*externalClient.Passport)
+			subMsg.Sender = passport.Id
+		}
+
+		// Redis로 발행할 때는 다시 JSON으로 마샬
+		data, err := json.Marshal(subMsg)
+		if err != nil {
+			log.Printf("JSON 마샬링 실패: %v\n", err)
+			continue
+		}
+
 		channelName := fmt.Sprintf("%s:%s", MirrorViewApplicationName, chatRoomId)
-		err = rdb.Publish(ctx, channelName, string(p)).Err()
-		if err != nil {
-			log.Printf("Redis 메시지 발행 실패: %v", err)
+		if err := rdb.Publish(context.Background(), channelName, data).Err(); err != nil {
+			log.Printf("Redis publish 실패: %v\n", err)
 		} else {
-			log.Printf("Redis 채널 '%s'에 메시지 발행: %s", channelName, string(p))
-		}
-
-		// 받은 메시지를 그대로 클라이언트에게 다시 보냅니다 (에코).
-		if err := ws.WriteMessage(messageType, p); err != nil {
-			log.Println("메시지 전송 실패: ", err)
-			break
+			log.Printf("Published to '%s': %s", channelName, data)
 		}
 	}
 }
