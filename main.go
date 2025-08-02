@@ -127,8 +127,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 
 		// 3) sender 가 비어 있다면, passport.Id 등으로 채워줍니다
 		if subMsg.Sender == "" {
-			// r.Context()에 담아둔 passport 꺼내기
-			passport := r.Context().Value("passport").(*externalClient.Passport)
 			subMsg.Sender = passport.Id
 		}
 
