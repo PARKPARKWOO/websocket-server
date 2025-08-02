@@ -44,6 +44,19 @@ type SucceededApiResponseBody struct {
 	Data string `json:"data"`
 }
 
+// 클라이언트에서 받는 메시지 구조체
+type ClientMessage struct {
+	Payload     string `json:"payload"`
+	MessageType string `json:"messageType"`
+}
+
+// Redis로 전송할 메시지 구조체
+type SubscribeMessage struct {
+	Sender      string `json:"sender"`
+	Payload     string `json:"payload"`
+	MessageType string `json:"messageType"`
+}
+
 // 클라이언트 연결을 처리하는 핸들러 함수입니다.
 func handleConnections(w http.ResponseWriter, r *http.Request, authClient *externalClient.AuthClient, rdb *redis.Client) {
 	bearerToken, err := service.GetBearerToken(r)
@@ -112,7 +125,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 
 		// Redis에 메시지 발행 (publish) - 채팅방 ID를 채널명으로 사용
 		ctx := context.Background()
-		channelName := fmt.Sprintf("%s:%s", MirrorViewApplicationName, chatRoomId)
+		channelName := fmt.Sprintf("%s-%s", MirrorViewApplicationName, chatRoomId)
 		err = rdb.Publish(ctx, channelName, string(p)).Err()
 		if err != nil {
 			log.Printf("Redis 메시지 발행 실패: %v", err)
@@ -225,18 +238,20 @@ func main() {
 	}
 	log.Println("Redis 연결 성공")
 
-	pubsub := rdb.Subscribe(ctx, MirrorViewApplicationName)
+	// 패턴으로 구독 (dev-mirror-view:* 패턴)
+	patternChannel := fmt.Sprintf("%s:*", MirrorViewApplicationName)
+	pubsub := rdb.PSubscribe(ctx, patternChannel)
 
 	// Wait for confirmation that subscription is created before publishing anything.
 	_, err = pubsub.Receive(ctx)
 	if err != nil {
-		log.Fatalf("Redis 구독 실패: %v", err)
+		log.Fatalf("Redis 패턴 구독 실패: %v", err)
 	}
 
 	// Go channel which receives messages.
 	ch := pubsub.Channel()
 
-	log.Printf("'%s' 채널을 구독합니다.", MirrorViewApplicationName)
+	log.Printf("'%s' 패턴을 구독합니다.", patternChannel)
 
 	// Start a goroutine to process incoming messages from the channel.
 	go func() {
