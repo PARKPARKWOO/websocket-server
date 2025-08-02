@@ -2,15 +2,23 @@ package main
 
 import (
 	"context"
+	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"log"
 	"net/http"
 	"os"
-	"strings"
+	//"strings"
 	"time"
 	externalClient "websocket-server/external"
+	service "websocket-server/service"
+)
+
+var (
+	MirrorViewDomain = os.Getenv("MV_HOST")
+	//TODO: 환경변수/DB 조회
+	MirrorViewApplicationName = "dev-mirror-view"
 )
 
 // WebSocket 연결을 HTTP 연결에서 업그레이드하는 역할을 합니다.
@@ -25,26 +33,9 @@ var upgrader = websocket.Upgrader{
 
 // 클라이언트 연결을 처리하는 핸들러 함수입니다.
 func handleConnections(w http.ResponseWriter, r *http.Request, authClient *externalClient.AuthClient) {
-	var bearerToken string
-
-	// 1. Authorization 헤더에서 토큰 먼저 확인
-	authHeader := r.Header.Get("Authorization")
-	if authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
-		bearerToken = strings.TrimPrefix(authHeader, "Bearer ")
-	}
-
-	// 2. 헤더에 토큰이 없으면 쿠키에서 확인
-	if bearerToken == "" {
-		tokenCookie, err := r.Cookie("accessToken")
-		if err == nil {
-			bearerToken = tokenCookie.Value
-		}
-	}
-
-	// 3. 헤더와 쿠키 모두에 토큰이 없는 경우, 연결 거부
-	if bearerToken == "" {
-		log.Println("인증 토큰을 찾을 수 없습니다 (헤더 및 쿠키 확인 완료).")
-		http.Error(w, "Unauthorized: Missing access token", http.StatusUnauthorized)
+	bearerToken, err := service.GetBearerToken(r)
+	if err != nil {
+		http.Error(w, "Unauthorized: Invalid token", http.StatusUnauthorized)
 		return
 	}
 
@@ -97,7 +88,56 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 	}
 }
 
+func handlePrivateNetworkConnection(w http.ResponseWriter, r *http.Request) {
+
+}
+
 func main() {
+	// Redis Pub/Sub 설정
+	redisHost := os.Getenv("REDIS_HOST")
+	if redisHost == "" {
+		redisHost = "localhost:6379"
+	}
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     redisHost,
+		Password: redisPassword,
+		DB:       0, // use default DB
+	})
+
+	ctx := context.Background()
+
+	// Ping the Redis server to check the connection.
+	_, err := rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Redis 연결 실패: %v", err)
+	}
+	log.Println("Redis 연결 성공")
+
+	pubsub := rdb.Subscribe(ctx, MirrorViewApplicationName)
+
+	// Wait for confirmation that subscription is created before publishing anything.
+	_, err = pubsub.Receive(ctx)
+	if err != nil {
+		log.Fatalf("Redis 구독 실패: %v", err)
+	}
+
+	// Go channel which receives messages.
+	ch := pubsub.Channel()
+
+	log.Printf("'%s' 채널을 구독합니다.", MirrorViewApplicationName)
+
+	// Start a goroutine to process incoming messages from the channel.
+	go func() {
+		defer pubsub.Close()
+		for msg := range ch {
+			log.Printf("Redis 채널 '%s'에서 메시지 수신: %s", msg.Channel, msg.Payload)
+			// 여기에 수신된 메시지를 처리하는 로직을 추가합니다.
+			// 예를 들어, 연결된 모든 웹소켓 클라이언트에게 메시지를 브로드캐스트할 수 있습니다.
+		}
+	}()
+
 	// 정적 파일(HTML, CSS, JS)을 제공하기 위한 파일 서버를 설정합니다.
 	// 현재 디렉토리의 "public" 폴더를 웹 루트로 사용합니다.
 	fs := http.FileServer(http.Dir("./public"))
@@ -112,6 +152,10 @@ func main() {
 	// "/ws" 경로로 들어오는 요청을 handleConnections 함수가 처리하도록 라우팅합니다.
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		handleConnections(w, r, authClient)
+	})
+
+	http.HandleFunc("/private/ws", func(w http.ResponseWriter, r *http.Request) {
+		handlePrivateNetworkConnection(w, r)
 	})
 
 	// 서버 시작
