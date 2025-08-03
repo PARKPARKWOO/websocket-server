@@ -5,12 +5,13 @@ go 1.23.0
 toolchain go1.24.2
 
 require (
-	github.com/go-redis/redis/v8 v8.11.5
 	github.com/gorilla/websocket v1.5.3
 	github.com/grafana/loki v1.6.1
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.19.1
 	github.com/labstack/echo/v4 v4.11.4
+	github.com/redis/go-redis/v9 v9.11.0
 	github.com/rs/cors v1.10.1
+	github.com/segmentio/kafka-go v0.4.48
 	github.com/sirupsen/logrus v1.9.3
 	github.com/weaveworks/common v0.0.0-20230728070032-dd9e68f319d5
 	go.uber.org/zap v1.27.0
@@ -35,6 +36,7 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/gorilla/mux v1.7.3 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
+	github.com/klauspost/compress v1.15.9 // indirect
 	github.com/labstack/gommon v0.4.2 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -43,6 +45,7 @@ require (
 	github.com/opentracing-contrib/go-grpc v0.0.0-20180928155321-4b5a12d3ff02 // indirect
 	github.com/opentracing-contrib/go-stdlib v1.0.0 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
+	github.com/pierrec/lz4/v4 v4.1.15 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_golang v1.14.0 // indirect
 	github.com/prometheus/client_model v0.3.0 // indirect
