@@ -1,3 +1,14 @@
+// 이 코드는 Kafka로 메시지를 발행(Produce)하고,
+// Redis 채널을 구독(Subscribe)하는 기능을 모두 포함한 버전입니다.
+//
+// 주요 기능:
+// 1. WebSocket 클라이언트로부터 메시지를 받아 Kafka 토픽으로 발행합니다.
+// 2. Redis의 특정 패턴 채널을 구독하여 메시지를 수신하고 로그에 기록합니다.
+//
+// --- 설치가 필요한 라이브러리 ---
+// go get github.com/segmentio/kafka-go
+// go get github.com/redis/go-redis/v9
+
 package main
 
 import (
@@ -5,37 +16,35 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"  // Redis 라이브러리 import
+	"github.com/segmentio/kafka-go" // Kafka 라이브러리 import
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"io"
 	"log"
 	"net/http"
 	"os"
-	//"strings"
+	"strings"
 	"time"
 	externalClient "websocket-server/external"
 	service "websocket-server/service"
 )
 
 var (
-	MirrorViewDomain = os.Getenv("MV_HOST")
-	//TODO: 환경변수/DB 조회
+	MirrorViewDomain          = os.Getenv("MV_HOST")
 	MirrorViewApplicationName = "dev-mirror-view"
 )
 
-// WebSocket 연결을 HTTP 연결에서 업그레이드하는 역할을 합니다.
-// 기본 설정을 사용하며, 모든 출처(Origin)의 요청을 허용하도록 설정합니다.
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // 모든 오리진 허용 (개발용)
+		return true
 	},
 }
 
-// HTTP 요청/응답 구조체
+// HTTP 요청/응답 구조체 (변경 없음)
 type CreateChatRoomRequest struct {
 	CreatedBy string `json:"createdBy"`
 }
@@ -44,21 +53,22 @@ type SucceededApiResponseBody struct {
 	Data string `json:"data"`
 }
 
-// 클라이언트에서 받는 메시지 구조체
+// 클라이언트에서 받는 메시지 구조체 (변경 없음)
 type ClientMessage struct {
 	Payload     string `json:"payload"`
 	MessageType string `json:"messageType"`
 }
 
-// Redis로 전송할 메시지 구조체
-type SubscribeMessage struct {
+// Kafka로 전송할 메시지 구조체 (기존 SubscribeMessage와 동일)
+type KafkaMessage struct {
 	Sender      string `json:"sender"`
 	Payload     string `json:"payload"`
 	MessageType string `json:"messageType"`
+	RoomId      string `json:"roomId"`
 }
 
-// 클라이언트 연결을 처리하는 핸들러 함수입니다.
-func handleConnections(w http.ResponseWriter, r *http.Request, authClient *externalClient.AuthClient, rdb *redis.Client) {
+// 클라이언트 연결을 처리하고 Kafka로 메시지를 발행하는 핸들러 함수입니다.
+func handleConnections(w http.ResponseWriter, r *http.Request, authClient *externalClient.AuthClient, producer *kafka.Writer) {
 	bearerToken, err := service.GetBearerToken(r)
 	if err != nil {
 		http.Error(w, "Unauthorized: Invalid token", http.StatusUnauthorized)
@@ -66,21 +76,16 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 	}
 
 	passport, err := authClient.GetPassportByBearerWithTimeout(bearerToken, 5*time.Second)
-
 	if err != nil {
-		// 토큰이 유효하지 않으면 401 Unauthorized 에러 반환
 		log.Printf("토큰 인증 실패: %v\n", err)
 		http.Error(w, "Unauthorized: Invalid token", http.StatusUnauthorized)
 		return
 	}
 
-	// 3. 인증 성공! 검증된 사용자 정보를 로그에 남기고, WebSocket 업그레이드 진행
 	log.Printf("사용자 인증 성공: UserID=%s, Role=%s\n", passport.Id, passport.Role)
 
-	// Chat Room ID 처리
 	chatRoomId := r.URL.Query().Get("chat_room_id")
 	if chatRoomId == "" {
-		// chat_room_id가 없으면 새로운 채팅방 생성
 		var err error
 		chatRoomId, err = createChatRoom(passport.Id)
 		if err != nil {
@@ -93,24 +98,15 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 		log.Printf("기존 채팅방 사용: %s\n", chatRoomId)
 	}
 
-	// (선택사항) 인증된 사용자 정보와 채팅방 ID를 context에 담아 다음 로직으로 전달
-	ctx := context.WithValue(r.Context(), "passport", passport)
-	ctx = context.WithValue(ctx, "chatRoomId", chatRoomId)
-	r = r.WithContext(ctx)
-
-	// HTTP GET 요청을 WebSocket 연결로 업그레이드합니다.
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("WebSocket 업그레이드 실패:", err)
 		return
 	}
-
-	// 함수가 종료될 때 웹소켓 연결을 반드시 닫도록 합니다.
 	defer ws.Close()
 
 	log.Println("새로운 클라이언트가 연결되었습니다.")
 
-	// 클라이언트로부터 메시지를 지속적으로 읽기 위한 무한 루프입니다.
 	for {
 		_, p, err := ws.ReadMessage()
 		if err != nil {
@@ -118,106 +114,122 @@ func handleConnections(w http.ResponseWriter, r *http.Request, authClient *exter
 			break
 		}
 
-		// 2) JSON → SubscribeMessage 언마샬
-		var subMsg SubscribeMessage
-		if err := json.Unmarshal(p, &subMsg); err != nil {
+		var kafkaMsg KafkaMessage
+		if err := json.Unmarshal(p, &kafkaMsg); err != nil {
 			log.Printf("JSON 언마샬링 실패: %v\n", err)
 			continue
 		}
 
-		// 3) sender 가 비어 있다면, passport.Id 등으로 채워줍니다
-		if subMsg.Sender == "" {
-			subMsg.Sender = passport.Id
+		if kafkaMsg.Sender == "" {
+			kafkaMsg.Sender = passport.Id
+		}
+		if kafkaMsg.RoomId == "" {
+			kafkaMsg.RoomId = chatRoomId
 		}
 
-		// Redis로 발행할 때는 다시 JSON으로 마샬
-		data, err := json.Marshal(subMsg)
+		data, err := json.Marshal(kafkaMsg)
 		if err != nil {
 			log.Printf("JSON 마샬링 실패: %v\n", err)
 			continue
 		}
 
-		channelName := fmt.Sprintf("%s:%s", MirrorViewApplicationName, chatRoomId)
-		if err := rdb.Publish(context.Background(), channelName, data).Err(); err != nil {
-			log.Printf("Redis publish 실패: %v\n", err)
+		err = producer.WriteMessages(context.Background(),
+			kafka.Message{
+				Key:   []byte(kafkaMsg.RoomId),
+				Value: data,
+			},
+		)
+
+		if err != nil {
+			log.Printf("Kafka publish 실패: %v\n", err)
 		} else {
-			log.Printf("Published to '%s': %s", channelName, data)
+			log.Printf("Published to Kafka topic '%s': %s", producer.Topic, data)
 		}
 	}
 }
 
 func handlePrivateNetworkConnection(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("upgrade error")
+	}
 
+	for {
+		_, p, err := ws.ReadMessage()
+		if err != nil {
+			log.Printf("error %v\n", err)
+		}
+		log.Println(p)
+	}
 }
 
-// 채팅방 생성 함수
+// 채팅방 생성 함수 (변경 없음)
 func createChatRoom(userId string) (string, error) {
-	// HTTP 클라이언트 생성 (타임아웃 설정)
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
-
-	// 요청 바디 생성
 	requestBody := CreateChatRoomRequest{
 		CreatedBy: userId,
 	}
-
 	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
 		return "", fmt.Errorf("JSON 마샬링 실패: %v", err)
 	}
-
-	// MirrorViewDomain이 설정되지 않았을 경우 기본값 사용
 	domain := MirrorViewDomain
 	if domain == "" {
-		// Docker Swarm 환경에서는 서비스 이름으로 통신
-		domain = "http://mirror-view-backend:8080" // 또는 환경에 맞는 서비스명
+		domain = "http://mirror-view-backend:8080"
 	}
-
 	url := fmt.Sprintf("%s/api/v1/chat/room", domain)
-
-	// HTTP POST 요청 생성
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", fmt.Errorf("HTTP 요청 생성 실패: %v", err)
 	}
-
-	// Content-Type 헤더 설정
 	req.Header.Set("Content-Type", "application/json")
-
-	// 요청 전송
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("HTTP 요청 실패: %v", err)
 	}
 	defer resp.Body.Close()
-
-	// 응답 상태 코드 확인
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP 요청 실패: status code %d", resp.StatusCode)
 	}
-
-	// 응답 바디 읽기
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("응답 바디 읽기 실패: %v", err)
 	}
-
-	// 응답 JSON 파싱
 	var response SucceededApiResponseBody
 	err = json.Unmarshal(bodyBytes, &response)
 	if err != nil {
 		return "", fmt.Errorf("응답 JSON 파싱 실패: %v", err)
 	}
-
 	return response.Data, nil
 }
 
+// Kafka Producer를 생성하는 헬퍼 함수
+func NewKafkaProducer(brokers []string, topic string) *kafka.Writer {
+	return &kafka.Writer{
+		Addr:     kafka.TCP(brokers...),
+		Topic:    topic,
+		Balancer: &kafka.LeastBytes{},
+	}
+}
+
 func main() {
+	// Kafka Producer 설정
+	kafkaBrokers := os.Getenv("KAFKA_HOST")
+	if kafkaBrokers == "" {
+		kafkaBrokers = "localhost:9092"
+	}
+	topic := "websocket-chat-message-streams"
+	producer := NewKafkaProducer(strings.Split(kafkaBrokers, ","), topic)
+	defer producer.Close()
+
+	log.Printf("Kafka Producer가 브로커 %s, 토픽 %s 로 연결되었습니다.", kafkaBrokers, topic)
+
+	// --- Redis 구독 로직 다시 추가 ---
 	// Redis Pub/Sub 설정
 	redisHost := os.Getenv("REDIS_HOST")
 	redisPort := os.Getenv("REDIS_PORT")
-
 	if redisHost == "" {
 		redisHost = "localhost"
 	}
@@ -225,53 +237,46 @@ func main() {
 		redisPort = "6379"
 	}
 	redisAddr := redisHost + ":" + redisPort
-
 	redisPassword := os.Getenv("REDIS_PASSWORD")
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisAddr,
 		Password: redisPassword,
-		DB:       0, // use default DB
+		DB:       0,
 	})
 
 	ctx := context.Background()
-
-	// Ping the Redis server to check the connection.
 	_, err := rdb.Ping(ctx).Result()
 	if err != nil {
 		log.Fatalf("Redis 연결 실패: %v", err)
 	}
 	log.Println("Redis 연결 성공")
 
-	// 패턴으로 구독 (dev-mirror-view:* 패턴)
+	// 패턴으로 구독
 	patternChannel := fmt.Sprintf("%s:*", MirrorViewApplicationName)
 	pubsub := rdb.PSubscribe(ctx, patternChannel)
-
-	// Wait for confirmation that subscription is created before publishing anything.
 	_, err = pubsub.Receive(ctx)
 	if err != nil {
 		log.Fatalf("Redis 패턴 구독 실패: %v", err)
 	}
 
-	// Go channel which receives messages.
-	ch := pubsub.Channel()
-
-	log.Printf("'%s' 패턴을 구독합니다.", patternChannel)
-
-	// Start a goroutine to process incoming messages from the channel.
+	// Redis 메시지 수신을 위한 goroutine
 	go func() {
 		defer pubsub.Close()
+		ch := pubsub.Channel()
 		for msg := range ch {
 			log.Printf("Redis 채널 '%s'에서 메시지 수신: %s", msg.Channel, msg.Payload)
-			// 여기에 수신된 메시지를 처리하는 로직을 추가합니다.
-			// 예를 들어, 연결된 모든 웹소켓 클라이언트에게 메시지를 브로드캐스트할 수 있습니다.
+			// 여기에 수신된 메시지를 모든 웹소켓 클라이언트에게 브로드캐스트하는 로직을 추가할 수 있습니다.
 		}
 	}()
+	log.Printf("'%s' 패턴을 구독합니다.", patternChannel)
+	// --- Redis 구독 로직 끝 ---
 
-	// 정적 파일(HTML, CSS, JS)을 제공하기 위한 파일 서버를 설정합니다.
-	// 현재 디렉토리의 "public" 폴더를 웹 루트로 사용합니다.
+	// 정적 파일 서버 설정 (변경 없음)
 	fs := http.FileServer(http.Dir("./public"))
 	http.Handle("/", fs)
+
+	// gRPC 클라이언트 설정 (변경 없음)
 	authHost := os.Getenv("AUTH_HOST")
 	conn, err := grpc.Dial(authHost, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -279,9 +284,10 @@ func main() {
 	}
 	defer conn.Close()
 	authClient := externalClient.NewAuthClient(conn)
-	// "/ws" 경로로 들어오는 요청을 handleConnections 함수가 처리하도록 라우팅합니다.
+
+	// HTTP 핸들러에 Kafka Producer를 전달합니다.
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		handleConnections(w, r, authClient, rdb)
+		handleConnections(w, r, authClient, producer)
 	})
 
 	http.HandleFunc("/private/ws", func(w http.ResponseWriter, r *http.Request) {
