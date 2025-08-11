@@ -172,20 +172,26 @@ func (ws *WebSocketService) HandleConnections(
 
 	// 클라이언트 처리 고루틴 시작
 	go client.writePump()
-	go client.readPump(kafkaService)
+	client.readPump(kafkaService)
 
 	// 연결 종료 시 정리
 	defer func() {
+		// 클라이언트 채널 닫기
+		close(client.Send)
+
+		// 방에서 클라이언트 제거
 		room.mux.Lock()
 		delete(room.Clients, client)
+		clientCount := len(room.Clients)
 		room.mux.Unlock()
-		close(client.Send)
+
+		// 연결 종료
 		conn.Close()
 
-		log.Printf("사용자 %s가 방 %s에서 나갔습니다. (현재 인원: %d)", passport.Id, chatRoomId, len(room.Clients))
+		log.Printf("사용자 %s가 방 %s에서 나갔습니다. (현재 인원: %d)", passport.Id, chatRoomId, clientCount)
 
 		// 방이 비어있으면 제거
-		if len(room.Clients) == 0 {
+		if clientCount == 0 {
 			ws.removeRoom(chatRoomId)
 		}
 	}()
@@ -207,7 +213,12 @@ func (c *Client) readPump(kafkaService *KafkaService) {
 	for {
 		_, p, err := c.Conn.ReadMessage()
 		if err != nil {
-			log.Printf("클라이언트 %s 메시지 읽기 실패: %v", c.UserID, err)
+			// 정상적인 연결 종료인지 확인
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("클라이언트 %s 예상치 못한 연결 종료: %v", c.UserID, err)
+			} else {
+				log.Printf("클라이언트 %s 연결 종료: %v", c.UserID, err)
+			}
 			break
 		}
 
@@ -244,22 +255,26 @@ func (c *Client) writePump() {
 		case message, ok := <-c.Send:
 			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if !ok {
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				// 채널이 닫혔으면 정상적인 종료 메시지 전송
+				c.Conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 				return
 			}
 
 			w, err := c.Conn.NextWriter(websocket.TextMessage)
 			if err != nil {
+				log.Printf("클라이언트 %s 메시지 쓰기 실패: %v", c.UserID, err)
 				return
 			}
 			w.Write(message)
 
 			if err := w.Close(); err != nil {
+				log.Printf("클라이언트 %s 메시지 전송 완료 실패: %v", c.UserID, err)
 				return
 			}
 		case <-ticker.C:
 			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("클라이언트 %s Ping 전송 실패: %v", c.UserID, err)
 				return
 			}
 		}
