@@ -23,6 +23,7 @@ import (
 var (
 	MirrorViewDomain          = os.Getenv("MV_HOST")
 	MirrorViewApplicationName = "dev-mirror-view"
+	BbrApplicationName        = "dev-bbr"
 )
 
 func main() {
@@ -50,12 +51,11 @@ func main() {
 	defer conn.Close()
 	authClient := externalClient.NewAuthClient(conn)
 
-	// Redis 패턴 구독 시작 - RoomId 기반 메시지 처리
-	patternChannel := MirrorViewApplicationName + ":*"
-	err = redisService.SubscribePattern(patternChannel, func(channel, payload string) {
+	// Redis 패턴 구독 시작 - Mirror-View: RoomId 기반 메시지 처리
+	mvPattern := MirrorViewApplicationName + ":*"
+	err = redisService.SubscribePattern(mvPattern, func(channel, payload string) {
 		log.Printf("Redis 채널 '%s'에서 메시지 수신: %s", channel, payload)
 
-		// 채널에서 RoomId 추출 (예: dev-mirror-view:room-123 -> room-123)
 		parts := strings.Split(channel, ":")
 		if len(parts) < 2 {
 			log.Printf("잘못된 채널 형식: %s", channel)
@@ -63,12 +63,29 @@ func main() {
 		}
 		roomID := parts[1]
 
-		// 해당 방의 모든 클라이언트에게 메시지 브로드캐스트
 		websocketService.BroadcastToRoom(roomID, []byte(payload))
 		log.Printf("방 %s의 모든 클라이언트에게 메시지 전송 완료", roomID)
 	})
 	if err != nil {
-		log.Fatalf("Redis 구독 실패: %v", err)
+		log.Fatalf("Mirror-View Redis 구독 실패: %v", err)
+	}
+
+	// Redis 패턴 구독 - BBR: UserId 기반 개인 알림 처리
+	bbrPattern := BbrApplicationName + ":*"
+	err = redisService.SubscribePattern(bbrPattern, func(channel, payload string) {
+		log.Printf("BBR Redis 채널 '%s'에서 메시지 수신: %s", channel, payload)
+
+		parts := strings.Split(channel, ":")
+		if len(parts) < 2 {
+			log.Printf("잘못된 채널 형식: %s", channel)
+			return
+		}
+		userID := parts[1]
+
+		websocketService.SendToUser(userID, []byte(payload))
+	})
+	if err != nil {
+		log.Fatalf("BBR Redis 구독 실패: %v", err)
 	}
 
 	// 정적 파일 서버 설정
@@ -76,6 +93,8 @@ func main() {
 	http.Handle("/", fs)
 
 	// HTTP 핸들러 설정
+	// /ws - 통합 WebSocket 엔드포인트 (연결만 맺고, 채팅방은 메시지로 join/leave)
+	// chat_room_id 쿼리 파라미터 있으면 자동 참가 (하위호환)
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		websocketService.HandleConnections(w, r, authClient, kafkaService, chatService)
 	})
