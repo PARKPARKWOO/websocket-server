@@ -16,6 +16,7 @@ import (
 	externalClient "websocket-server/external"
 	service "websocket-server/service"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -114,6 +115,25 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(statsJSON)
 	})
+
+	// Liveness - 프로세스 살아있는지만 확인
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	// Readiness - 의존성(Redis) 연결 상태까지 체크
+	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if err := redisService.Ping(r.Context()); err != nil {
+			http.Error(w, "redis unreachable: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ready"))
+	})
+
+	// Prometheus scrape
+	http.Handle("/metrics", promhttp.Handler())
 
 	// 서버 시작
 	log.Println("HTTP 서버가 8080 포트에서 시작됩니다.")

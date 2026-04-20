@@ -54,9 +54,9 @@ RUN chown -R appuser:appgroup /app
 # 비root 사용자로 전환
 USER appuser
 
-# 헬스체크 추가
-#HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-#    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/ || exit 1
+# 헬스체크: /healthz 엔드포인트로 Liveness 확인
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1
 
 # 포트 노출
 EXPOSE 8080

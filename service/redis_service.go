@@ -46,6 +46,11 @@ func NewRedisService() *RedisService {
 	}
 }
 
+// Ping Redis 서버 연결 헬스체크용
+func (r *RedisService) Ping(ctx context.Context) error {
+	return r.client.Ping(ctx).Err()
+}
+
 // SubscribePattern 패턴으로 Redis 채널 구독
 func (r *RedisService) SubscribePattern(pattern string, messageHandler func(channel, payload string)) error {
 	pubsub := r.client.PSubscribe(r.ctx, pattern)
