@@ -1,5 +1,6 @@
 # 빌드 스테이지
-FROM golang:1.23-alpine AS builder
+# go.mod 의 toolchain go1.24.2 와 일치시킴. protoc-gen-go-grpc v1.6+ 가 Go 1.24+ 요구.
+FROM golang:1.24-alpine AS builder
 
 # 필요한 시스템 패키지 설치
 RUN apk add --no-cache git ca-certificates tzdata
