@@ -8,11 +8,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 	externalClient "websocket-server/external"
 	service "websocket-server/service"
 
@@ -27,7 +34,35 @@ var (
 	BbrApplicationName        = "dev-bbr"
 )
 
+func loadResellWebSocketConfig() (*service.ResellWebSocketConfig, error) {
+	rawEnabled := strings.TrimSpace(os.Getenv("RESELL_WEBSOCKET_ENABLED"))
+	if rawEnabled == "" {
+		return nil, nil
+	}
+	enabled, err := strconv.ParseBool(rawEnabled)
+	if err != nil {
+		return nil, fmt.Errorf("RESELL_WEBSOCKET_ENABLED must be true or false: %w", err)
+	}
+	if !enabled {
+		return nil, nil
+	}
+	config, err := service.NewResellWebSocketConfig(
+		os.Getenv("RESELL_APPLICATION_ID"),
+		os.Getenv("WEBSOCKET_ALLOWED_ORIGINS"),
+		os.Getenv("RESELL_REDIS_CHANNEL_PREFIX"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &config, nil
+}
+
 func main() {
+	resellConfig, err := loadResellWebSocketConfig()
+	if err != nil {
+		log.Fatalf("Resell WebSocket 설정 오류: %v", err)
+	}
+
 	// 서비스들 초기화
 	kafkaService := service.NewKafkaService()
 	defer kafkaService.Close()
@@ -55,7 +90,7 @@ func main() {
 	// Redis 패턴 구독 시작 - Mirror-View: RoomId 기반 메시지 처리
 	mvPattern := MirrorViewApplicationName + ":*"
 	err = redisService.SubscribePattern(mvPattern, func(channel, payload string) {
-		log.Printf("Redis 채널 '%s'에서 메시지 수신: %s", channel, payload)
+		log.Printf("Redis 채널 '%s'에서 메시지 수신", channel)
 
 		parts := strings.Split(channel, ":")
 		if len(parts) < 2 {
@@ -74,7 +109,7 @@ func main() {
 	// Redis 패턴 구독 - BBR: UserId 기반 개인 알림 처리
 	bbrPattern := BbrApplicationName + ":*"
 	err = redisService.SubscribePattern(bbrPattern, func(channel, payload string) {
-		log.Printf("BBR Redis 채널 '%s'에서 메시지 수신: %s", channel, payload)
+		log.Printf("BBR Redis 채널 '%s'에서 메시지 수신", channel)
 
 		parts := strings.Split(channel, ":")
 		if len(parts) < 2 {
@@ -89,6 +124,24 @@ func main() {
 		log.Fatalf("BBR Redis 구독 실패: %v", err)
 	}
 
+	if resellConfig != nil {
+		// Resell: base64url owner ID 기반의 검증된 metadata-only wake-up 알림.
+		err = redisService.SubscribePattern(resellConfig.RedisChannelPattern, func(channel, payload string) {
+			ownerID, decodeErr := resellConfig.DecodeOwnerID(channel)
+			if decodeErr != nil {
+				log.Printf("Resell Redis 메시지 폐기: 잘못된 채널 (%v)", decodeErr)
+				return
+			}
+			if sendErr := websocketService.SendToResellUser(ownerID, payload); sendErr != nil {
+				log.Printf("Resell Redis 메시지 폐기: 잘못된 envelope (%v)", sendErr)
+				return
+			}
+		})
+		if err != nil {
+			log.Fatalf("Resell Redis 구독 실패: %v", err)
+		}
+	}
+
 	// 정적 파일 서버 설정
 	fs := http.FileServer(http.Dir("./public"))
 	http.Handle("/", fs)
@@ -99,6 +152,13 @@ func main() {
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		websocketService.HandleConnections(w, r, authClient, kafkaService, chatService)
 	})
+
+	if resellConfig != nil {
+		// /ws/resell - 인증·Origin·application scope가 고정된 알림 전용 endpoint.
+		http.HandleFunc("/ws/resell", func(w http.ResponseWriter, r *http.Request) {
+			websocketService.HandleResellConnections(w, r, authClient, *resellConfig)
+		})
+	}
 
 	http.HandleFunc("/private/ws", func(w http.ResponseWriter, r *http.Request) {
 		websocketService.HandlePrivateNetworkConnection(w, r)
@@ -124,6 +184,10 @@ func main() {
 
 	// Readiness - 의존성(Redis) 연결 상태까지 체크
 	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if websocketService.IsResellDraining() {
+			http.Error(w, "service draining", http.StatusServiceUnavailable)
+			return
+		}
 		if err := redisService.Ping(r.Context()); err != nil {
 			http.Error(w, "redis unreachable: "+err.Error(), http.StatusServiceUnavailable)
 			return
@@ -135,9 +199,44 @@ func main() {
 	// Prometheus scrape
 	http.Handle("/metrics", promhttp.Handler())
 
-	// 서버 시작
-	log.Println("HTTP 서버가 8080 포트에서 시작됩니다.")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal("ListenAndServe: ", err)
+	server := &http.Server{
+		Addr:              ":8080",
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       75 * time.Second,
+	}
+	serverErrors := make(chan error, 1)
+	go func() {
+		log.Println("HTTP 서버가 8080 포트에서 시작됩니다.")
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	select {
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP server stopped unexpectedly: %v", err)
+		}
+		return
+	case <-signalContext.Done():
+	}
+
+	connectionCount := websocketService.BeginResellServiceRestart()
+	log.Printf("graceful shutdown started: resell_connections=%d", connectionCount)
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- server.Shutdown(shutdownContext)
+	}()
+
+	drainContext, cancelDrain := context.WithTimeout(shutdownContext, 5*time.Second)
+	if err := websocketService.WaitForResellDrain(drainContext); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("Resell WebSocket drain reached its deadline: %v", err)
+	}
+	cancelDrain()
+	if err := <-shutdownDone; err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("HTTP graceful shutdown failed: %v", err)
 	}
 }

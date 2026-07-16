@@ -63,7 +63,7 @@ func (r *RedisService) SubscribePattern(pattern string, messageHandler func(chan
 		defer pubsub.Close()
 		ch := pubsub.Channel()
 		for msg := range ch {
-			log.Printf("Redis 채널 '%s'에서 메시지 수신: %s", msg.Channel, msg.Payload)
+			log.Printf("Redis pattern '%s'에서 메시지 수신", pattern)
 			if messageHandler != nil {
 				messageHandler(msg.Channel, msg.Payload)
 			}

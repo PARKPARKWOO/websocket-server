@@ -15,8 +15,13 @@ services:
       - REDIS_PORT=${REDIS_PORT:-6379}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - MV_HOST=${MV_HOST:-http://mirror-view-backend:8080}
+      - "RESELL_WEBSOCKET_ENABLED=${RESELL_WEBSOCKET_ENABLED:-false}"
+      - "RESELL_APPLICATION_ID=${RESELL_APPLICATION_ID:-}"
+      - "WEBSOCKET_ALLOWED_ORIGINS=${WEBSOCKET_ALLOWED_ORIGINS:-}"
+      - "RESELL_REDIS_CHANNEL_PREFIX=${RESELL_REDIS_CHANNEL_PREFIX:-dev-resell:*}"
     networks:
       - websocket-network
+    stop_grace_period: 15s
     deploy:
       replicas: 2
       update_config:
@@ -44,7 +49,7 @@ services:
         preferences:
           - spread: node.labels.zone
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/readyz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -57,4 +62,3 @@ networks:
     ipam:
       config:
         - subnet: 10.0.9.0/24
-

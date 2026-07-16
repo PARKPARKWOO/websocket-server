@@ -3,9 +3,11 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	externalClient "websocket-server/external"
@@ -14,12 +16,20 @@ import (
 )
 
 type WebSocketService struct {
-	upgrader   websocket.Upgrader
-	rooms      map[string]*Room
-	roomsMux   sync.RWMutex
-	clients    map[string]map[*Client]bool // userId -> clients (한 유저가 여러 기기에서 접속 가능)
-	clientsMux sync.RWMutex
+	upgrader        websocket.Upgrader
+	rooms           map[string]*Room
+	roomsMux        sync.RWMutex
+	clients         map[ClientScope]map[string]map[*Client]bool // scope -> userId -> clients
+	clientsMux      sync.RWMutex
+	resellAccepting bool
 }
+
+type ClientScope string
+
+const (
+	clientScopeChat   ClientScope = "chat"
+	clientScopeResell ClientScope = "resell"
+)
 
 type Room struct {
 	ID      string
@@ -28,17 +38,21 @@ type Room struct {
 }
 
 type Client struct {
-	Conn    *websocket.Conn
-	UserID  string
-	Rooms   map[string]bool // 참여 중인 방 목록
-	Send    chan []byte
-	service *WebSocketService
-	roomMux sync.RWMutex
+	Conn             *websocket.Conn
+	UserID           string
+	Scope            ClientScope
+	Rooms            map[string]bool // 참여 중인 방 목록
+	Send             chan []byte
+	Restart          chan struct{}
+	service          *WebSocketService
+	roomMux          sync.RWMutex
+	restart          sync.Once
+	restartFrameSent atomic.Bool
 }
 
 // ClientAction 클라이언트에서 보내는 메시지 형식
 type ClientAction struct {
-	Action      string `json:"action"`      // join_room, leave_room, chat (생략 시 chat)
+	Action      string `json:"action"` // join_room, leave_room, chat (생략 시 chat)
 	RoomId      string `json:"roomId"`
 	Payload     string `json:"payload"`
 	MessageType string `json:"messageType"`
@@ -54,8 +68,12 @@ func NewWebSocketService() *WebSocketService {
 				return true
 			},
 		},
-		rooms:   make(map[string]*Room),
-		clients: make(map[string]map[*Client]bool),
+		rooms: make(map[string]*Room),
+		clients: map[ClientScope]map[string]map[*Client]bool{
+			clientScopeChat:   make(map[string]map[*Client]bool),
+			clientScopeResell: make(map[string]map[*Client]bool),
+		},
+		resellAccepting: true,
 	}
 }
 
@@ -91,14 +109,111 @@ func (ws *WebSocketService) removeRoom(roomID string) {
 // ── 클라이언트 관리 ──
 
 func (ws *WebSocketService) registerClient(client *Client) {
+	ws.registerClientWithLimit(client, 0)
+}
+
+func (ws *WebSocketService) registerClientWithLimit(client *Client, maxPerUser int) bool {
 	ws.clientsMux.Lock()
 	defer ws.clientsMux.Unlock()
-
-	if ws.clients[client.UserID] == nil {
-		ws.clients[client.UserID] = make(map[*Client]bool)
+	if client.Scope == clientScopeResell && !ws.resellAccepting {
+		return false
 	}
-	ws.clients[client.UserID][client] = true
-	log.Printf("클라이언트 등록: UserID=%s (연결 수: %d)", client.UserID, len(ws.clients[client.UserID]))
+
+	scopeClients := ws.clients[client.Scope]
+	if scopeClients == nil {
+		scopeClients = make(map[string]map[*Client]bool)
+		ws.clients[client.Scope] = scopeClients
+	}
+	if scopeClients[client.UserID] == nil {
+		scopeClients[client.UserID] = make(map[*Client]bool)
+	}
+	if maxPerUser > 0 && len(scopeClients[client.UserID]) >= maxPerUser {
+		return false
+	}
+	scopeClients[client.UserID][client] = true
+	log.Printf("클라이언트 등록: scope=%s (연결 수: %d)", client.Scope, len(scopeClients[client.UserID]))
+	return true
+}
+
+// BeginResellServiceRestart rejects new Resell upgrades and asks existing
+// notification-only clients to reconnect to another deployment.
+func (ws *WebSocketService) BeginResellServiceRestart() int {
+	ws.clientsMux.Lock()
+	ws.resellAccepting = false
+	clients := make([]*Client, 0)
+	for _, userClients := range ws.clients[clientScopeResell] {
+		for client := range userClients {
+			clients = append(clients, client)
+		}
+	}
+	ws.clientsMux.Unlock()
+
+	var restartWrites sync.WaitGroup
+	for _, client := range clients {
+		client.restart.Do(func() {
+			restartWrites.Add(1)
+			go func(client *Client) {
+				defer restartWrites.Done()
+				client.writeServiceRestart()
+				if client.Restart != nil {
+					close(client.Restart)
+				}
+			}(client)
+		})
+	}
+	restartWrites.Wait()
+	return len(clients)
+}
+
+// writeServiceRestart uses Gorilla's concurrency-safe control-frame path so a
+// queued notification cannot delay the 1012 frame behind ordinary writes.
+func (client *Client) writeServiceRestart() {
+	if client.Conn == nil || !client.restartFrameSent.CompareAndSwap(false, true) {
+		return
+	}
+	if err := client.Conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseServiceRestart, "service restart"),
+		time.Now().Add(resellRestartWriteWait),
+	); err != nil {
+		client.restartFrameSent.Store(false)
+	}
+}
+
+func (ws *WebSocketService) IsResellDraining() bool {
+	ws.clientsMux.RLock()
+	defer ws.clientsMux.RUnlock()
+	return !ws.resellAccepting
+}
+
+// WaitForResellDrain waits for read pumps to unregister after the 1012 close.
+// On deadline it force-closes the remaining sockets so process termination is bounded.
+func (ws *WebSocketService) WaitForResellDrain(ctx context.Context) error {
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		ws.clientsMux.RLock()
+		clients := make([]*Client, 0)
+		for _, userClients := range ws.clients[clientScopeResell] {
+			for client := range userClients {
+				clients = append(clients, client)
+			}
+		}
+		ws.clientsMux.RUnlock()
+		if len(clients) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			for _, client := range clients {
+				if client.Conn != nil {
+					_ = client.Conn.Close()
+				}
+			}
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (ws *WebSocketService) unregisterClient(client *Client) {
@@ -116,17 +231,18 @@ func (ws *WebSocketService) unregisterClient(client *Client) {
 
 	// 클라이언트 인덱스에서 제거
 	ws.clientsMux.Lock()
-	if userClients, exists := ws.clients[client.UserID]; exists {
+	scopeClients := ws.clients[client.Scope]
+	if userClients, exists := scopeClients[client.UserID]; exists {
 		delete(userClients, client)
 		if len(userClients) == 0 {
-			delete(ws.clients, client.UserID)
+			delete(scopeClients, client.UserID)
 		}
 	}
 	ws.clientsMux.Unlock()
 
 	close(client.Send)
 	client.Conn.Close()
-	log.Printf("클라이언트 연결 해제: UserID=%s", client.UserID)
+	log.Printf("클라이언트 연결 해제: scope=%s", client.Scope)
 }
 
 // ── 방 참가/퇴장 ──
@@ -205,28 +321,40 @@ func (ws *WebSocketService) BroadcastToRoom(roomID string, message []byte) {
 
 // SendToUser 특정 userId를 가진 모든 클라이언트에게 메시지 전송
 func (ws *WebSocketService) SendToUser(userID string, message []byte) {
+	ws.sendToUserInScope(clientScopeChat, userID, message)
+}
+
+// SendToResellUser는 strict schema를 통과한 wake-up만 Resell 전용 연결에 전송한다.
+func (ws *WebSocketService) SendToResellUser(userID, payload string) error {
+	if !validResellOwnerID(userID) {
+		return errors.New("invalid Resell user identifier")
+	}
+	message, err := ParseResellWakeEnvelope(payload)
+	if err != nil {
+		return err
+	}
+	ws.sendToUserInScope(clientScopeResell, userID, message)
+	return nil
+}
+
+func (ws *WebSocketService) sendToUserInScope(scope ClientScope, userID string, message []byte) {
 	ws.clientsMux.RLock()
-	userClients, exists := ws.clients[userID]
+	userClients, exists := ws.clients[scope][userID]
 	if !exists {
 		ws.clientsMux.RUnlock()
-		log.Printf("사용자 %s가 연결되어 있지 않음", userID)
 		return
 	}
 
-	clients := make([]*Client, 0, len(userClients))
+	connectionCount := len(userClients)
 	for client := range userClients {
-		clients = append(clients, client)
-	}
-	ws.clientsMux.RUnlock()
-
-	for _, client := range clients {
 		select {
 		case client.Send <- message:
 		default:
 			client.Conn.Close()
 		}
 	}
-	log.Printf("사용자 %s에게 알림 전송 완료 (%d개 연결)", userID, len(clients))
+	ws.clientsMux.RUnlock()
+	log.Printf("scope=%s 알림 전송 완료 (%d개 연결)", scope, connectionCount)
 }
 
 // ── WebSocket 연결 핸들러 ──
@@ -264,6 +392,7 @@ func (ws *WebSocketService) HandleConnections(
 	client := &Client{
 		Conn:    conn,
 		UserID:  passport.Id,
+		Scope:   clientScopeChat,
 		Rooms:   make(map[string]bool),
 		Send:    make(chan []byte, 256),
 		service: ws,

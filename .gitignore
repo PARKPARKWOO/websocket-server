@@ -143,6 +143,7 @@ Network Trash Folder
 Temporary Items
 .apdisk
 .idea
+.env
 ### macOS Patch ###
 # iCloud generated files
 *.icloud
